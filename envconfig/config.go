@@ -211,8 +211,15 @@ var (
 	EnableVulkan = Bool("OLLAMA_VULKAN")
 	// NoCloudEnv checks the OLLAMA_NO_CLOUD environment variable.
 	NoCloudEnv = Bool("OLLAMA_NO_CLOUD")
-	// UseAirLLM enables the AirLLM inference backend instead of the default Ollama backend.
-	// AirLLM reduces GPU VRAM usage via model compression/layer-wise inference.
+	// UseAirLLM enables the VRAM-aware automatic layer scheduler.
+	// When set, the runner computes n_gpu_layers from available free VRAM
+	// (using llama/airllm.cpp) rather than relying on Ollama's memory-fit
+	// estimator.  This prevents VRAM OOM when the model is larger than the
+	// available GPU memory by capping the offloaded layers to what actually
+	// fits, with the remaining layers running on CPU/RAM.
+	//
+	// Note: this is NOT the full AirLLM layer-by-layer GPU streaming.
+	// It is an automatic n_gpu_layers calculator based on VRAM budget.
 	UseAirLLM = Bool("OLLAMA_USE_AIRLLM")
 )
 
@@ -294,7 +301,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_MAX_QUEUE":         {"OLLAMA_MAX_QUEUE", MaxQueue(), "Maximum number of queued requests"},
 		"OLLAMA_MODELS":            {"OLLAMA_MODELS", Models(), "The path to the models directory"},
 		"OLLAMA_NO_CLOUD":          {"OLLAMA_NO_CLOUD", NoCloud(), "Disable Ollama cloud features (remote inference and web search)"},
-		"OLLAMA_USE_AIRLLM":        {"OLLAMA_USE_AIRLLM", UseAirLLM(), "Enable the AirLLM inference backend for reduced VRAM usage"},
+		"OLLAMA_USE_AIRLLM":        {"OLLAMA_USE_AIRLLM", UseAirLLM(), "Enable VRAM-aware automatic n_gpu_layers scheduler (prevents VRAM OOM for large models)"},
 		"OLLAMA_NOHISTORY":         {"OLLAMA_NOHISTORY", NoHistory(), "Do not preserve readline history"},
 		"OLLAMA_NOPRUNE":           {"OLLAMA_NOPRUNE", NoPrune(), "Do not prune model blobs on startup"},
 		"OLLAMA_NUM_PARALLEL":      {"OLLAMA_NUM_PARALLEL", NumParallel(), "Maximum number of parallel requests"},

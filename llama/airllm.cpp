@@ -1,18 +1,33 @@
 /**
- * airllm.cpp – C++ implementation of the AirLLM layer-budget scheduler.
+ * airllm.cpp – VRAM-aware automatic layer scheduler for llama.cpp
  *
- * Integrates with llama.cpp / GGML to provide:
- *   - VRAM introspection via the GGML backend API
- *   - Layer-count and weight-size estimation directly from GGUF metadata
- *     (no full model load required – uses gguf_get_tensor_size() to sum
- *      tensor byte-sizes from the file's tensor-info section)
- *   - Optimal n_gpu_layers calculation for a given VRAM budget
+ * What this implements
+ * --------------------
+ * Reads the GGUF model file (metadata only, no weight data) to estimate the
+ * byte size of each transformer layer, then queries free VRAM via the GGML
+ * backend API, and returns the largest n_gpu_layers value that fits within
+ * that budget (minus a configurable overhead for KV-cache / activations).
  *
- * The design mirrors AirLLM's core insight
- * (https://github.com/lyogavin/airllm): divide the model into per-layer
- * weight slices and only keep as many slices in GPU VRAM as the budget allows.
- * llama.cpp's existing n_gpu_layers parameter implements exactly this split at
- * the inference level, so all we need is to compute the right value for it.
+ * The result is passed directly to llama.cpp's existing n_gpu_layers parameter,
+ * which is llama.cpp's standard split: the first N layers run on GPU, the
+ * remainder run on CPU/RAM.
+ *
+ * What this does NOT implement
+ * ----------------------------
+ * The original AirLLM project (https://github.com/lyogavin/airllm) performs
+ * true layer-by-layer GPU streaming: it loads one transformer layer at a time
+ * onto the GPU, processes it, then unloads it before loading the next.  This
+ * allows models far larger than total VRAM to run (at a significant latency
+ * cost).  That streaming mechanism is NOT implemented here; it would require
+ * changes to the llama.cpp forward-pass internals.
+ *
+ * What you gain with --airllm
+ * ---------------------------
+ * Without --airllm: Ollama's memory-fit estimator assigns n_gpu_layers.  If
+ *   its estimate is too optimistic the model load fails with VRAM OOM.
+ * With --airllm: the scheduler measures actual free VRAM at load time and caps
+ *   offloading to what is provably safe, so large models that would otherwise
+ *   OOM run successfully (with some layers on CPU, which is slower).
  */
 
 #include "airllm.h"

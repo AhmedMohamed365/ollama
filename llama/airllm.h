@@ -1,20 +1,36 @@
 /**
- * airllm.h – Layer-wise low-VRAM inference scheduler for llama.cpp
+ * airllm.h – VRAM-aware automatic layer scheduler for llama.cpp
  *
- * AirLLM concept (https://github.com/lyogavin/airllm):
- *   Run large language models on GPUs with far less VRAM by processing the
- *   model one layer-window at a time rather than holding the entire model in
- *   GPU memory at once.
+ * What this provides
+ * ------------------
+ * Automatic computation of llama.cpp's n_gpu_layers based on the actual
+ * free VRAM available at model-load time.  The goal is to prevent VRAM
+ * out-of-memory errors when loading large models onto small GPUs.
  *
- * This C++ implementation integrates directly with llama.cpp / GGML and
- * exposes a plain-C interface so that the Go runtime can call it via CGo.
+ * Concretely:
+ *   1. airllm_layer_budget() opens the GGUF file with no_alloc=true,
+ *      reads all tensor shapes/types from the info section (no weight
+ *      data is mapped), sums the per-layer byte sizes, and divides the
+ *      available VRAM by that estimate.
+ *   2. The result (n_gpu_layers) is passed to llama.cpp's standard
+ *      llama_model_params.n_gpu_layers field.
+ *   3. llama.cpp then places the first n_gpu_layers transformer blocks on
+ *      GPU and the remaining blocks on CPU/RAM – its normal hybrid mode.
  *
- * Usage flow:
- *   1. airllm_layer_budget()    – query how many layers fit in available VRAM
- *   2. Use the returned n_gpu_layers value in llama_model_params when loading
- *      the model via the normal llama_model_load_from_file() call.
- *   3. airllm_vram_query()      – inspect free/total VRAM on the first GPU
- *   4. airllm_compute_budget()  – pure-math helper (also used for testing)
+ * What this does NOT do
+ * ---------------------
+ * True AirLLM (https://github.com/lyogavin/airllm) streams individual
+ * layers to the GPU one at a time during inference, unloading each after
+ * use.  That allows models much larger than total VRAM, at high latency
+ * cost.  This header/implementation does NOT perform that streaming;
+ * it simply automates the n_gpu_layers calculation.
+ *
+ * Benefit over standard Ollama scheduling
+ * ----------------------------------------
+ * Ollama's default memory estimator can be inaccurate for some models or
+ * in fragmented-VRAM scenarios.  This scheduler measures actual free VRAM
+ * at load time and guarantees that the selected n_gpu_layers fits, which
+ * avoids OOM failures when loading models larger than expected.
  */
 
 #ifndef AIRLLM_H

@@ -15,7 +15,7 @@ type VRAMInfo struct {
 	TotalBytes uint64
 }
 
-// LayerBudget is the result of AirLLMLayerBudget.
+// LayerBudget is the result of AirLLMLayerBudget and AirLLMComputeBudget.
 type LayerBudget struct {
 	// NGPULayers is the recommended llama_model_params.n_gpu_layers value.
 	// Pass this to ModelParams.NumGpuLayers when loading the model.
@@ -40,6 +40,29 @@ func AirLLMVRAMQuery() VRAMInfo {
 	return VRAMInfo{
 		FreeBytes:  uint64(info.free_bytes),
 		TotalBytes: uint64(info.total_bytes),
+	}
+}
+
+// AirLLMComputeBudget computes the optimal GPU layer count using pure math
+// (no file I/O, no GPU calls).  Useful for testing and for callers that
+// already know the model's layer count and total weight byte size.
+//
+//   - nTotalLayers:    number of transformer blocks
+//   - totalModelBytes: sum of all tensor byte sizes
+//   - vramBudget:      available VRAM in bytes (must be > 0)
+//   - overheadBytes:   bytes to reserve; 0 → 256 MiB default
+func AirLLMComputeBudget(nTotalLayers int, totalModelBytes uint64, vramBudget uint64, overheadBytes uint64) LayerBudget {
+	b := C.airllm_compute_budget(
+		C.int(nTotalLayers),
+		C.uint64_t(totalModelBytes),
+		C.size_t(vramBudget),
+		C.size_t(overheadBytes),
+	)
+	return LayerBudget{
+		NGPULayers:    int(b.n_gpu_layers),
+		NTotalLayers:  int(b.n_total_layers),
+		BytesPerLayer: uint64(b.bytes_per_layer),
+		VRAMFreeBytes: uint64(b.vram_free_bytes),
 	}
 }
 

@@ -3,7 +3,9 @@
  *
  * Integrates with llama.cpp / GGML to provide:
  *   - VRAM introspection via the GGML backend API
- *   - Layer-count estimation from GGUF metadata (no full model load required)
+ *   - Layer-count and weight-size estimation directly from GGUF metadata
+ *     (no full model load required – uses gguf_get_tensor_size() to sum
+ *      tensor byte-sizes from the file's tensor-info section)
  *   - Optimal n_gpu_layers calculation for a given VRAM budget
  *
  * The design mirrors AirLLM's core insight
@@ -18,7 +20,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
-#include "llama.h"
 
 #include <cstring>
 #include <cstdio>
@@ -60,11 +61,14 @@ static ggml_backend_dev_t airllm_first_gpu_device(void) {
 
 /**
  * Read a uint32 value from a GGUF context by key.
- * Returns 0 when the key is absent.
+ * Returns 0 when the key is absent (and logs a debug note).
  */
 static uint32_t gguf_get_u32_or_zero(struct gguf_context *ctx, const char *key) {
     int64_t idx = gguf_find_key(ctx, key);
-    if (idx < 0) return 0;
+    if (idx < 0) {
+        fprintf(stderr, "airllm: metadata key '%s' not found in GGUF file\n", key);
+        return 0;
+    }
     return gguf_get_val_u32(ctx, idx);
 }
 
@@ -83,6 +87,20 @@ static void gguf_get_arch(struct gguf_context *ctx, char *buf, size_t buf_size) 
     buf[buf_size - 1] = '\0';
 }
 
+/**
+ * Sum the byte sizes of all tensors in a GGUF context.
+ * Each tensor's size is computed from its shape and ggml_type; this works
+ * even when the GGUF was opened with no_alloc=true (tensor data not mapped).
+ */
+static uint64_t gguf_sum_tensor_bytes(struct gguf_context *ctx) {
+    uint64_t total = 0;
+    int64_t n = gguf_get_n_tensors(ctx);
+    for (int64_t i = 0; i < n; i++) {
+        total += (uint64_t)gguf_get_tensor_size(ctx, i);
+    }
+    return total;
+}
+
 /* -------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------- */
@@ -97,6 +115,40 @@ struct airllm_vram_info airllm_vram_query(void) {
     return info;
 }
 
+struct airllm_budget airllm_compute_budget(int    n_total_layers,
+                                            uint64_t total_model_bytes,
+                                            size_t   vram_budget,
+                                            size_t   overhead_bytes) {
+    struct airllm_budget result = {0, n_total_layers, 0, vram_budget};
+
+    if (n_total_layers <= 0 || total_model_bytes == 0) {
+        return result;
+    }
+
+    /* Bytes per layer, accounting for the embedding/output weight equivalent */
+    size_t bytes_per_layer =
+        (size_t)(total_model_bytes / (uint64_t)(n_total_layers + AIRLLM_EMBEDDING_EQUIV));
+    result.bytes_per_layer = bytes_per_layer;
+
+    if (bytes_per_layer == 0) return result;
+
+    size_t effective_overhead =
+        (overhead_bytes > 0) ? overhead_bytes : AIRLLM_DEFAULT_OVERHEAD;
+
+    if (vram_budget <= effective_overhead) {
+        return result;
+    }
+    size_t usable_vram = vram_budget - effective_overhead;
+
+    int n_gpu = (int)(usable_vram / bytes_per_layer);
+    if (n_gpu > n_total_layers) {
+        n_gpu = n_total_layers;
+    }
+
+    result.n_gpu_layers = n_gpu;
+    return result;
+}
+
 struct airllm_budget airllm_layer_budget(const char *model_path,
                                           size_t      vram_budget,
                                           size_t      overhead_bytes) {
@@ -106,6 +158,10 @@ struct airllm_budget airllm_layer_budget(const char *model_path,
 
     /* ------------------------------------------------------------------
      * Step 1: Open GGUF metadata without allocating tensor data.
+     *
+     * With no_alloc=true the library reads all KV pairs and tensor-info
+     * records (name, shape, type, offset) but does NOT mmap or copy the
+     * actual weight bytes.  This is fast and RAM-cheap for large models.
      * ------------------------------------------------------------------ */
     struct gguf_init_params gparams;
     memset(&gparams, 0, sizeof(gparams));
@@ -130,94 +186,52 @@ struct airllm_budget airllm_layer_budget(const char *model_path,
     if (arch[0] != '\0') {
         snprintf(block_count_key, sizeof(block_count_key), "%s.block_count", arch);
     } else {
-        /* Fallback: try generic key used by some models */
+        /* Architecture string is missing – log a warning and use the llama
+         * fallback key.  This will only work if the model actually uses
+         * "llama.block_count"; for other architectures the caller should
+         * ensure the GGUF file has a valid general.architecture entry. */
+        fprintf(stderr, "airllm: general.architecture not found; falling back to 'llama.block_count'\n");
         strncpy(block_count_key, "llama.block_count", sizeof(block_count_key) - 1);
         block_count_key[sizeof(block_count_key) - 1] = '\0';
     }
 
     uint32_t n_layers = gguf_get_u32_or_zero(gctx, block_count_key);
-    gguf_free(gctx);
 
     if (n_layers == 0) {
         fprintf(stderr, "airllm: could not determine layer count from '%s'\n", model_path);
+        gguf_free(gctx);
         return result;
     }
 
-    result.n_total_layers = (int)n_layers;
+    /* ------------------------------------------------------------------
+     * Step 3: Sum all tensor byte-sizes from the GGUF tensor-info section.
+     *
+     * gguf_get_tensor_size(ctx, i) returns the exact byte size for tensor i
+     * based on its shape and ggml_type – no weight data is read.  This avoids
+     * a full llama_model_load_from_file call (which would load all weights
+     * into RAM) and makes the function safe to call even when RAM is limited.
+     * ------------------------------------------------------------------ */
+    uint64_t total_bytes = gguf_sum_tensor_bytes(gctx);
+    gguf_free(gctx);
 
     /* ------------------------------------------------------------------
-     * Step 3: Load model with 0 GPU layers to get total weight size.
-     *
-     * We use llama_model_load_from_file with n_gpu_layers=0 so that no VRAM
-     * is allocated.  This gives us llama_model_size() which is the total
-     * byte size of all model weights.
+     * Step 4: Determine VRAM budget (use GPU free VRAM when not overridden).
      * ------------------------------------------------------------------ */
-    struct llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;     /* CPU-only load for metadata inspection */
-    mparams.use_mmap     = true;  /* mmap keeps RAM pressure low */
-    mparams.vocab_only   = false;
-
-    struct llama_model *model = llama_model_load_from_file(model_path, mparams);
-    if (!model) {
-        fprintf(stderr, "airllm: failed to load model weights metadata: %s\n", model_path);
-        return result;
-    }
-
-    uint64_t total_bytes = llama_model_size(model);
-    llama_model_free(model);
-
-    /* ------------------------------------------------------------------
-     * Step 4: Estimate bytes per transformer layer.
-     *
-     * The total model weight includes:
-     *   - Token embeddings (input + output) – roughly equivalent to 1 layer
-     *   - n_layers transformer blocks
-     *
-     * We approximate: bytes_per_layer = total_bytes / (n_layers + 1)
-     * ------------------------------------------------------------------ */
-    if (total_bytes == 0) {
-        fprintf(stderr, "airllm: model reports 0 bytes for '%s'\n", model_path);
-        return result;
-    }
-
-    size_t bytes_per_layer = (size_t)(total_bytes / (uint64_t)(n_layers + AIRLLM_EMBEDDING_EQUIV));
-    result.bytes_per_layer = bytes_per_layer;
-
-    /* ------------------------------------------------------------------
-     * Step 5: Determine VRAM budget.
-     * ------------------------------------------------------------------ */
-    size_t effective_overhead = (overhead_bytes > 0) ? overhead_bytes
-                                                      : AIRLLM_DEFAULT_OVERHEAD;
-
-    size_t available_vram;
+    size_t effective_vram;
     if (vram_budget > 0) {
-        available_vram = vram_budget;
+        effective_vram = vram_budget;
     } else {
         struct airllm_vram_info vinfo = airllm_vram_query();
-        available_vram = vinfo.free_bytes;
+        effective_vram = vinfo.free_bytes;
     }
-    result.vram_free_bytes = available_vram;
-
-    /* Guard against overhead exceeding budget */
-    if (available_vram <= effective_overhead) {
-        result.n_gpu_layers = 0;
-        return result;
-    }
-    size_t usable_vram = available_vram - effective_overhead;
 
     /* ------------------------------------------------------------------
-     * Step 6: Compute how many layers fit.
+     * Step 5: Delegate to the pure-math helper.
      * ------------------------------------------------------------------ */
-    if (bytes_per_layer == 0) {
-        result.n_gpu_layers = 0;
-        return result;
-    }
+    struct airllm_budget budget =
+        airllm_compute_budget((int)n_layers, total_bytes, effective_vram, overhead_bytes);
 
-    int n_gpu = (int)(usable_vram / bytes_per_layer);
-    if (n_gpu > (int)n_layers) {
-        n_gpu = (int)n_layers;
-    }
-
-    result.n_gpu_layers = n_gpu;
-    return result;
+    /* Overwrite the vram_free_bytes field with the actual queried value */
+    budget.vram_free_bytes = effective_vram;
+    return budget;
 }

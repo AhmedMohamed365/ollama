@@ -305,6 +305,11 @@ type Server struct {
 
 	// next sequence for prompt processing to avoid starvation
 	nextSeq int
+
+	// useAirLLM enables the layer-wise VRAM budget scheduler (AirLLM mode).
+	// When true, the number of GPU layers is determined by airllm_layer_budget
+	// rather than the value coming from the load request.
+	useAirLLM bool
 }
 
 func (s *Server) allNil() bool {
@@ -919,6 +924,42 @@ func (s *Server) load(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// ── Comparison metrics ──────────────────────────────────────────
+		// Always query current VRAM state so the log can be compared
+		// between a standard run and an AirLLM-scheduled run.
+		vramState := llama.AirLLMVRAMQuery()
+		standardNumGPU := numGPU // the value Ollama's normal scheduler chose
+
+		// AirLLM mode: override n_gpu_layers with the value computed by
+		// the C++ VRAM-aware layer scheduler (llama/airllm.cpp).
+		//
+		// ┌─ What this does ────────────────────────────────────────────┐
+		// │  Reads the GGUF metadata to sum per-layer weight sizes,     │
+		// │  queries current free VRAM, and computes the largest        │
+		// │  n_gpu_layers that fits within that budget (minus a 256 MiB │
+		// │  overhead reserve for KV-cache and compute buffers).        │
+		// │                                                              │
+		// │  This is equivalent to llama.cpp's standard partial layer   │
+		// │  offloading (n_gpu_layers), but with automatic calculation   │
+		// │  instead of the user or Ollama guessing the right value.    │
+		// ├─ What this does NOT do ────────────────────────────────────┤
+		// │  True AirLLM (github.com/lyogavin/airllm) streams one       │
+		// │  layer at a time to GPU, processes it, then unloads it –    │
+		// │  allowing models larger than total VRAM. That level of      │
+		// │  layer-by-layer streaming is not yet implemented here.      │
+		// └────────────────────────────────────────────────────────────┘
+		var budget llama.LayerBudget
+		if s.useAirLLM {
+			const useCurrentFreeVRAM = 0 // 0 → query GPU at call time
+			const useDefaultOverhead = 0 // 0 → use 256 MiB default
+			budget = llama.AirLLMLayerBudget(s.modelPath, useCurrentFreeVRAM, useDefaultOverhead)
+			numGPU = budget.NGPULayers
+		}
+
+		// ── Emit side-by-side metrics so the operator can see exactly ──
+		// ── what changed when AirLLM mode is toggled. ─────────────────
+		logLayerMetrics(s.modelPath, standardNumGPU, numGPU, budget, vramState, s.useAirLLM)
+
 		params := llama.ModelParams{
 			Devices:      llamaIDs,
 			NumGpuLayers: numGPU,
@@ -948,10 +989,85 @@ func (s *Server) load(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// logLayerMetrics emits a structured log that lets operators compare layer
+// assignment with and without AirLLM mode.  It is called on every model load.
+//
+// Example output (without AirLLM):
+//
+//	INFO  layer plan  mode=standard  model=/models/llama3-8b.gguf
+//	      standard_n_gpu=32  active_n_gpu=32
+//	      vram_free_MiB=5800  vram_total_MiB=6144
+//
+// Example output (with AirLLM):
+//
+//	INFO  layer plan  mode=airllm  model=/models/llama3-70b.gguf
+//	      standard_n_gpu=80  active_n_gpu=11  total_layers=80
+//	      bytes_per_layer_MiB=505  vram_free_MiB=5800  vram_total_MiB=6144
+//	      estimated_gpu_weight_MiB=5555  vram_saved_vs_standard_MiB=34789
+//	      NOTE="n_gpu_layers is set automatically; layers not on GPU run on CPU/RAM"
+func logLayerMetrics(
+	modelPath string,
+	standardNumGPU int,
+	activeNumGPU int,
+	budget llama.LayerBudget,
+	vram llama.VRAMInfo,
+	airllmMode bool,
+) {
+	const mib = uint64(1024 * 1024)
+
+	mode := "standard"
+	if airllmMode {
+		mode = "airllm"
+	}
+
+	vramFreeMiB := vram.FreeBytes / mib
+	vramTotalMiB := vram.TotalBytes / mib
+
+	if !airllmMode {
+		// Standard mode: print what n_gpu_layers was assigned and current VRAM.
+		slog.Info("layer plan",
+			"mode", mode,
+			"model", modelPath,
+			"standard_n_gpu", standardNumGPU,
+			"active_n_gpu", activeNumGPU,
+			"vram_free_MiB", vramFreeMiB,
+			"vram_total_MiB", vramTotalMiB,
+		)
+		return
+	}
+
+	// AirLLM mode: print the full budget comparison.
+	bytesPerLayerMiB := budget.BytesPerLayer / mib
+	estimatedGPUWeightMiB := uint64(activeNumGPU) * (budget.BytesPerLayer / mib)
+
+	// VRAM that standard mode would have used for all requested GPU layers
+	// (approximated as standard_n_gpu × bytes_per_layer).
+	standardEstimatedMiB := uint64(standardNumGPU) * bytesPerLayerMiB
+	var savedMiB uint64
+	if standardEstimatedMiB > estimatedGPUWeightMiB {
+		savedMiB = standardEstimatedMiB - estimatedGPUWeightMiB
+	}
+
+	slog.Info("layer plan",
+		"mode", mode,
+		"model", modelPath,
+		"standard_n_gpu", standardNumGPU,
+		"active_n_gpu", activeNumGPU,
+		"total_layers", budget.NTotalLayers,
+		"bytes_per_layer_MiB", bytesPerLayerMiB,
+		"vram_free_MiB", vramFreeMiB,
+		"vram_total_MiB", vramTotalMiB,
+		"estimated_gpu_weight_MiB", estimatedGPUWeightMiB,
+		"vram_saved_vs_standard_MiB", savedMiB,
+		"note", "n_gpu_layers auto-set; layers not on GPU run on CPU/RAM (slower but fits in VRAM)",
+	)
+}
+
 func Execute(args []string) error {
 	fs := flag.NewFlagSet("runner", flag.ExitOnError)
 	mpath := fs.String("model", "", "Path to model binary file")
 	port := fs.Int("port", 8080, "Port to expose the server on")
+	useAirLLM := fs.Bool("airllm", false, "Enable VRAM-aware layer scheduler (AirLLM mode): automatically compute n_gpu_layers from free VRAM")
 	_ = fs.Bool("verbose", false, "verbose output (default: disabled)")
 
 	fs.Usage = func() {
@@ -969,6 +1085,21 @@ func Execute(args []string) error {
 	server := &Server{
 		modelPath: *mpath,
 		status:    llm.ServerStatusLaunched,
+		useAirLLM: *useAirLLM,
+	}
+
+	if *useAirLLM {
+		vram := llama.AirLLMVRAMQuery()
+		slog.Info("airllm mode enabled – VRAM-aware layer scheduler active",
+			"vram_free_bytes", vram.FreeBytes,
+			"vram_total_bytes", vram.TotalBytes,
+			"what_it_does", "automatically computes n_gpu_layers so the model fits in free VRAM",
+			"what_it_does_not", "layer-by-layer GPU streaming (true AirLLM) is not yet implemented",
+		)
+	} else {
+		slog.Info("standard mode – Ollama memory scheduler active",
+			"note", "use --airllm or OLLAMA_USE_AIRLLM=true to enable automatic VRAM-aware layer scheduling",
+		)
 	}
 
 	server.ready.Add(1)

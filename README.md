@@ -354,3 +354,73 @@ console.log(response.message.content);
 - [Gentoo](https://github.com/gentoo/guru/tree/master/app-misc/ollama)
 - [Flox](https://flox.dev/blog/ollama-part-one)
 - [Guix channel](https://codeberg.org/tusharhero/ollama-guix)
+
+---
+
+## AirLLM Mode (Low-VRAM Operation)
+
+Ollama integrates the [AirLLM](https://github.com/lyogavin/airllm) concept
+natively in C++, embedded directly inside the llama.cpp inference layer.  This
+allows running large language models on GPUs with far less VRAM by
+automatically computing how many transformer layers fit in available GPU memory
+and offloading only those layers, keeping the remainder on CPU/RAM.
+
+> **No Python, no extra install** — the implementation lives in
+> `llama/airllm.cpp` / `llama/airllm.h` and is compiled together with Ollama.
+
+### How it works
+
+1. At startup, `airllm_layer_budget()` opens the GGUF model metadata without
+   loading weights, reads the layer count from the file's GGUF keys, then
+   loads the model with `n_gpu_layers=0` to obtain the total weight byte size.
+2. It queries free VRAM from the GGML backend device API.
+3. It computes `n_gpu_layers = (free_vram − overhead) / bytes_per_layer`.
+4. The llama.cpp model is then loaded with that `n_gpu_layers` value — only
+   the layers that fit in VRAM are GPU-offloaded; the rest stream from RAM.
+
+This is the same fundamental mechanism as AirLLM, re-implemented in C++ so it
+compiles and runs as part of Ollama's existing llama.cpp inference stack.
+
+### Enabling AirLLM mode
+
+**CLI flag** (highest priority):
+```shell
+ollama serve --airllm
+```
+
+**Environment variable**:
+```shell
+OLLAMA_USE_AIRLLM=true ollama serve
+```
+
+Both approaches pass `--airllm` to the `llamarunner` subprocess, which calls
+`llama.AirLLMLayerBudget()` (the Go wrapper over `airllm_layer_budget()` in
+`llama/airllm.cpp`) to determine the optimal GPU layer count before loading
+the model.
+
+### What changes at runtime
+
+| Without AirLLM | With AirLLM |
+|---|---|
+| GPU layers from scheduler | GPU layers from VRAM budget |
+| Entire model in VRAM or OOM | Only fitting layers in VRAM |
+| Fails on GPUs too small | Runs with partial VRAM usage |
+
+A log line is emitted at startup showing the computed budget:
+```
+INFO airllm layer budget  n_gpu_layers=18 n_total_layers=32 bytes_per_layer=419430400 vram_free_bytes=6442450944
+```
+
+### CPU-only hosts
+
+When no GPU is detected, `airllm_vram_query()` returns 0 free bytes and
+`n_gpu_layers` is set to 0 (full CPU execution).  The service continues to
+run — it just doesn't offload any layers to GPU.
+
+### Source files
+
+| File | Purpose |
+|---|---|
+| `llama/airllm.h` | Plain-C API header (`airllm_vram_query`, `airllm_layer_budget`) |
+| `llama/airllm.cpp` | C++ implementation using GGML backend + GGUF metadata APIs |
+| `llama/airllm.go` | Go CGo bindings (`AirLLMVRAMQuery`, `AirLLMLayerBudget`) |

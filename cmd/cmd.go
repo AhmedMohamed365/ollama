@@ -1743,9 +1743,19 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	return nil
 }
 
-func RunServer(_ *cobra.Command, _ []string) error {
+func RunServer(cmd *cobra.Command, _ []string) error {
 	if err := initializeKeypair(); err != nil {
 		return err
+	}
+
+	// --airllm sets OLLAMA_USE_AIRLLM so the llamarunner subprocess activates
+	// the VRAM-aware automatic n_gpu_layers scheduler (llama/airllm.cpp).
+	// This computes how many transformer layers fit in free VRAM and caps
+	// offloading accordingly, preventing VRAM OOM for large models.
+	if useAirLLM, _ := cmd.Flags().GetBool("airllm"); useAirLLM {
+		if err := os.Setenv("OLLAMA_USE_AIRLLM", "true"); err != nil {
+			return fmt.Errorf("failed to set OLLAMA_USE_AIRLLM: %w", err)
+		}
 	}
 
 	ln, err := net.Listen("tcp", envconfig.Host().Host)
@@ -2178,6 +2188,7 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(0),
 		RunE:    RunServer,
 	}
+	serveCmd.Flags().Bool("airllm", false, "Enable VRAM-aware automatic layer scheduler: caps n_gpu_layers to what fits in free VRAM, preventing VRAM OOM for large models")
 
 	pullCmd := &cobra.Command{
 		Use:     "pull MODEL",
@@ -2315,6 +2326,7 @@ func NewCLI() *cobra.Command {
 				envVars["OLLAMA_LLM_LIBRARY"],
 				envVars["OLLAMA_GPU_OVERHEAD"],
 				envVars["OLLAMA_LOAD_TIMEOUT"],
+				envVars["OLLAMA_USE_AIRLLM"],
 			})
 		default:
 			appendEnvDocs(cmd, envs)

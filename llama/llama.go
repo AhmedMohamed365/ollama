@@ -19,6 +19,7 @@ package llama
 #include "gguf.h"
 
 #include "sampling_ext.h"
+#include "airllm.h"
 
 extern bool llamaProgressCallback(float progress, void *user_data);
 extern void llamaLog(int level, char* text, void* user_data);

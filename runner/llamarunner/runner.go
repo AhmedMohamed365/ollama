@@ -305,6 +305,11 @@ type Server struct {
 
 	// next sequence for prompt processing to avoid starvation
 	nextSeq int
+
+	// useAirLLM enables the layer-wise VRAM budget scheduler (AirLLM mode).
+	// When true, the number of GPU layers is determined by airllm_layer_budget
+	// rather than the value coming from the load request.
+	useAirLLM bool
 }
 
 func (s *Server) allNil() bool {
@@ -919,6 +924,25 @@ func (s *Server) load(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// AirLLM mode: override n_gpu_layers with the value computed by the
+		// C++ layer-budget scheduler.  This limits VRAM usage to however many
+		// transformer layers fit within the GPU's free VRAM, keeping the rest
+		// on CPU/RAM – the core mechanism behind AirLLM's low-VRAM operation.
+		if s.useAirLLM {
+			// useCurrentFreeVRAM=0 → query GPU at call time.
+			// useDefaultOverhead=0 → use the 256 MiB default in airllm.cpp.
+			const useCurrentFreeVRAM = 0
+			const useDefaultOverhead = 0
+			budget := llama.AirLLMLayerBudget(s.modelPath, useCurrentFreeVRAM, useDefaultOverhead)
+			slog.Info("airllm layer budget",
+				"n_gpu_layers", budget.NGPULayers,
+				"n_total_layers", budget.NTotalLayers,
+				"bytes_per_layer", budget.BytesPerLayer,
+				"vram_free_bytes", budget.VRAMFreeBytes,
+			)
+			numGPU = budget.NGPULayers
+		}
+
 		params := llama.ModelParams{
 			Devices:      llamaIDs,
 			NumGpuLayers: numGPU,
@@ -952,6 +976,7 @@ func Execute(args []string) error {
 	fs := flag.NewFlagSet("runner", flag.ExitOnError)
 	mpath := fs.String("model", "", "Path to model binary file")
 	port := fs.Int("port", 8080, "Port to expose the server on")
+	useAirLLM := fs.Bool("airllm", false, "Enable AirLLM layer-budget mode: limit GPU layers to fit available VRAM")
 	_ = fs.Bool("verbose", false, "verbose output (default: disabled)")
 
 	fs.Usage = func() {
@@ -969,6 +994,15 @@ func Execute(args []string) error {
 	server := &Server{
 		modelPath: *mpath,
 		status:    llm.ServerStatusLaunched,
+		useAirLLM: *useAirLLM,
+	}
+
+	if *useAirLLM {
+		vram := llama.AirLLMVRAMQuery()
+		slog.Info("airllm mode enabled",
+			"vram_free_bytes", vram.FreeBytes,
+			"vram_total_bytes", vram.TotalBytes,
+		)
 	}
 
 	server.ready.Add(1)

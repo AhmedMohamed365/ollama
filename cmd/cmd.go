@@ -1749,7 +1749,8 @@ func RunServer(cmd *cobra.Command, _ []string) error {
 	}
 
 	// --airllm flag sets the OLLAMA_USE_AIRLLM environment variable so that it
-	// is visible to the Python integration layer launched as a subprocess.
+	// is picked up by the llamarunner subprocess, which passes --airllm to the
+	// native C++ AirLLM layer-budget scheduler (llama/airllm.cpp).
 	if useAirLLM, _ := cmd.Flags().GetBool("airllm"); useAirLLM {
 		if err := os.Setenv("OLLAMA_USE_AIRLLM", "true"); err != nil {
 			return fmt.Errorf("failed to set OLLAMA_USE_AIRLLM: %w", err)

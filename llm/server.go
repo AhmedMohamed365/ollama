@@ -349,6 +349,9 @@ func StartRunner(ollamaEngine bool, modelPath string, gpuLibs []string, out io.W
 		params = append(params, "--model", modelPath)
 	}
 	params = append(params, "--port", strconv.Itoa(port))
+	if envconfig.UseAirLLM() {
+		params = append(params, "--airllm")
+	}
 
 	var pathEnv string
 	switch runtime.GOOS {

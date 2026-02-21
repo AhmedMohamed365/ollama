@@ -357,95 +357,70 @@ console.log(response.message.content);
 
 ---
 
-## AirLLM Backend (Optional — Reduced VRAM Usage)
+## AirLLM Mode (Low-VRAM Operation)
 
-Ollama includes an optional [AirLLM](https://github.com/lyogavin/airllm) integration
-that enables layer-wise inference, dramatically reducing the GPU VRAM required to run
-large models.
+Ollama integrates the [AirLLM](https://github.com/lyogavin/airllm) concept
+natively in C++, embedded directly inside the llama.cpp inference layer.  This
+allows running large language models on GPUs with far less VRAM by
+automatically computing how many transformer layers fit in available GPU memory
+and offloading only those layers, keeping the remainder on CPU/RAM.
 
-### How to Enable AirLLM Mode
+> **No Python, no extra install** — the implementation lives in
+> `llama/airllm.cpp` / `llama/airllm.h` and is compiled together with Ollama.
 
-**Option 1 — CLI flag** (highest priority):
+### How it works
+
+1. At startup, `airllm_layer_budget()` opens the GGUF model metadata without
+   loading weights, reads the layer count from the file's GGUF keys, then
+   loads the model with `n_gpu_layers=0` to obtain the total weight byte size.
+2. It queries free VRAM from the GGML backend device API.
+3. It computes `n_gpu_layers = (free_vram − overhead) / bytes_per_layer`.
+4. The llama.cpp model is then loaded with that `n_gpu_layers` value — only
+   the layers that fit in VRAM are GPU-offloaded; the rest stream from RAM.
+
+This is the same fundamental mechanism as AirLLM, re-implemented in C++ so it
+compiles and runs as part of Ollama's existing llama.cpp inference stack.
+
+### Enabling AirLLM mode
+
+**CLI flag** (highest priority):
 ```shell
 ollama serve --airllm
 ```
 
-**Option 2 — Environment variable**:
+**Environment variable**:
 ```shell
 OLLAMA_USE_AIRLLM=true ollama serve
 ```
 
-**Option 3 — YAML config file** (`~/.ollama/airllm_config.yaml`):
-```yaml
-inference:
-  engine: airllm          # "airllm" or "ollama"
-  compression_ratio: 4.0  # higher = less VRAM, potentially lower quality
-ollama:
-  base_url: http://127.0.0.1:11434
-```
+Both approaches pass `--airllm` to the `llamarunner` subprocess, which calls
+`llama.AirLLMLayerBudget()` (the Go wrapper over `airllm_layer_budget()` in
+`llama/airllm.cpp`) to determine the optimal GPU layer count before loading
+the model.
 
-### Python Integration Layer
+### What changes at runtime
 
-The AirLLM integration code lives in `airllm_integration/`.
-
-**Install dependencies**:
-```shell
-pip install airllm transformers torch
-# Optional for YAML config:
-pip install pyyaml
-```
-
-**Run directly**:
-```shell
-python -m airllm_integration --model meta-llama/Llama-2-7b-hf \
-    --prompt "Explain layer-wise inference" --airllm
-```
-
-### Graceful Fallback
-
-If AirLLM fails to import, load a model, or generate output, the service
-automatically falls back to the standard OllamaBackend without crashing.
-A structured JSON log entry is emitted:
-
-```json
-{
-  "primary_backend": "AirLLMBackend",
-  "fallback_backend": "OllamaBackend",
-  "error": "...",
-  "model": "llama3"
-}
-```
-
-### Logs
-
-Every backend selection and load event is logged as structured JSON:
-
-```json
-{
-  "backend": "airllm",
-  "model": "meta-llama/Llama-2-7b-hf",
-  "gpu_available": true,
-  "vram_before": "12500 MiB",
-  "vram_after": "3200 MiB",
-  "status": "success"
-}
-```
-
-### Limitations
-
-| Limitation | Notes |
+| Without AirLLM | With AirLLM |
 |---|---|
-| Hugging Face model IDs only | AirLLM does not support Ollama-native GGUF models.  The fallback to OllamaBackend is automatic. |
-| GPU required for production | CPU-only execution is supported for testing but is extremely slow. |
-| Throughput penalty | Layer-loading adds latency; not recommended for real-time workloads. |
+| GPU layers from scheduler | GPU layers from VRAM budget |
+| Entire model in VRAM or OOM | Only fitting layers in VRAM |
+| Fails on GPUs too small | Runs with partial VRAM usage |
 
-### CPU-Only Testing
-
-No GPU is required to run the test suite.  All GPU calls are mocked.
-
-```shell
-python -m pytest airllm_integration/tests/ -v
+A log line is emitted at startup showing the computed budget:
+```
+INFO airllm layer budget  n_gpu_layers=18 n_total_layers=32 bytes_per_layer=419430400 vram_free_bytes=6442450944
 ```
 
-See [`airllm_integration/validation_report.md`](airllm_integration/validation_report.md)
-for the full CPU-only validation report and hypothetical VRAM analysis.
+### CPU-only hosts
+
+When no GPU is detected, `airllm_vram_query()` returns 0 free bytes and
+`n_gpu_layers` is set to 0 (full CPU execution).  The service continues to
+run — it just doesn't offload any layers to GPU.
+
+### Source files
+
+| File | Purpose |
+|---|---|
+| `llama/airllm.h` | Plain-C API header (`airllm_vram_query`, `airllm_layer_budget`) |
+| `llama/airllm.cpp` | C++ implementation using GGML backend + GGUF metadata APIs |
+| `llama/airllm.go` | Go CGo bindings (`AirLLMVRAMQuery`, `AirLLMLayerBudget`) |

@@ -354,3 +354,98 @@ console.log(response.message.content);
 - [Gentoo](https://github.com/gentoo/guru/tree/master/app-misc/ollama)
 - [Flox](https://flox.dev/blog/ollama-part-one)
 - [Guix channel](https://codeberg.org/tusharhero/ollama-guix)
+
+---
+
+## AirLLM Backend (Optional — Reduced VRAM Usage)
+
+Ollama includes an optional [AirLLM](https://github.com/lyogavin/airllm) integration
+that enables layer-wise inference, dramatically reducing the GPU VRAM required to run
+large models.
+
+### How to Enable AirLLM Mode
+
+**Option 1 — CLI flag** (highest priority):
+```shell
+ollama serve --airllm
+```
+
+**Option 2 — Environment variable**:
+```shell
+OLLAMA_USE_AIRLLM=true ollama serve
+```
+
+**Option 3 — YAML config file** (`~/.ollama/airllm_config.yaml`):
+```yaml
+inference:
+  engine: airllm          # "airllm" or "ollama"
+  compression_ratio: 4.0  # higher = less VRAM, potentially lower quality
+ollama:
+  base_url: http://127.0.0.1:11434
+```
+
+### Python Integration Layer
+
+The AirLLM integration code lives in `airllm_integration/`.
+
+**Install dependencies**:
+```shell
+pip install airllm transformers torch
+# Optional for YAML config:
+pip install pyyaml
+```
+
+**Run directly**:
+```shell
+python -m airllm_integration --model meta-llama/Llama-2-7b-hf \
+    --prompt "Explain layer-wise inference" --airllm
+```
+
+### Graceful Fallback
+
+If AirLLM fails to import, load a model, or generate output, the service
+automatically falls back to the standard OllamaBackend without crashing.
+A structured JSON log entry is emitted:
+
+```json
+{
+  "primary_backend": "AirLLMBackend",
+  "fallback_backend": "OllamaBackend",
+  "error": "...",
+  "model": "llama3"
+}
+```
+
+### Logs
+
+Every backend selection and load event is logged as structured JSON:
+
+```json
+{
+  "backend": "airllm",
+  "model": "meta-llama/Llama-2-7b-hf",
+  "gpu_available": true,
+  "vram_before": "12500 MiB",
+  "vram_after": "3200 MiB",
+  "status": "success"
+}
+```
+
+### Limitations
+
+| Limitation | Notes |
+|---|---|
+| Hugging Face model IDs only | AirLLM does not support Ollama-native GGUF models.  The fallback to OllamaBackend is automatic. |
+| GPU required for production | CPU-only execution is supported for testing but is extremely slow. |
+| Throughput penalty | Layer-loading adds latency; not recommended for real-time workloads. |
+
+### CPU-Only Testing
+
+No GPU is required to run the test suite.  All GPU calls are mocked.
+
+```shell
+python -m pytest airllm_integration/tests/ -v
+```
+
+See [`airllm_integration/validation_report.md`](airllm_integration/validation_report.md)
+for the full CPU-only validation report and hypothetical VRAM analysis.
